@@ -261,6 +261,7 @@
       text-align: center;
       padding: 1.5rem 0;
       text-shadow: 0 0 10px rgba(255, 61, 113, 0.3);
+      line-height: 1.5;
     }
 
     .sukses-judul {
@@ -508,6 +509,7 @@
       padding: 0.15rem 0.5rem;
       border-radius: 20px;
       border: 1px solid rgba(0, 255, 157, 0.3);
+      white-space: nowrap;
     }
 
     .toast {
@@ -526,6 +528,8 @@
       transition: all 0.3s ease;
       z-index: 9999;
       pointer-events: none;
+      max-width: 90%;
+      text-align: center;
     }
 
     .toast.show {
@@ -619,6 +623,7 @@
       BACKEND_URL: '/api/cari',
       RIWAYAT_KEY: 'am_preset_riwayat',
       RIWAYAT_MAX: 10,
+      TIMEOUT_MS: 60000, // 60 detik
     };
 
     /* ============================================================
@@ -636,14 +641,14 @@
     const toast         = document.getElementById('toast');
 
     /* ============================================================
-       TOAST NOTIFICATION
+       TOAST
        ============================================================ */
     let toastTimer = null;
     function showToast(msg) {
       toast.textContent = msg;
       toast.classList.add('show');
       clearTimeout(toastTimer);
-      toastTimer = setTimeout(() => toast.classList.remove('show'), 2000);
+      toastTimer = setTimeout(() => toast.classList.remove('show'), 2500);
     }
 
     /* ============================================================
@@ -669,9 +674,8 @@
         return { valid: false, pesan: '⚠️ Itu bukan link TikTok yang benar.' };
       }
 
-      // Cek panjang path — URL TikTok valid minimal 8 karakter
       const path = parsed.pathname.replace(/\/$/, '');
-      if (path.length < 8) {
+      if (path.length < 6) {
         return {
           valid: false,
           pesan: '⚠️ URL kayaknya kepotong. Copy ulang dari tombol Share TikTok.',
@@ -737,7 +741,6 @@
 
     function simpanRiwayat(url, jumlahPreset) {
       const riwayat = ambilRiwayat();
-      // Hapus duplikat URL
       const filtered = riwayat.filter((r) => r.url !== url);
       filtered.unshift({ url, waktu: Date.now(), jumlahPreset });
       localStorage.setItem(CONFIG.RIWAYAT_KEY, JSON.stringify(filtered.slice(0, CONFIG.RIWAYAT_MAX)));
@@ -776,7 +779,6 @@
         `;
       }).join('');
 
-      // Event listener klik riwayat
       riwayatList.querySelectorAll('.riwayat-link').forEach((a) => {
         a.addEventListener('click', () => {
           urlInput.value = a.getAttribute('data-url');
@@ -792,32 +794,76 @@
       const endpoint = `${CONFIG.BACKEND_URL}?url=${encodeURIComponent(url)}`;
       console.log('[Fetch]', endpoint);
 
+      // Timeout via AbortController
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), CONFIG.TIMEOUT_MS);
+
       let res;
       try {
-        res = await fetch(endpoint);
-      } catch {
+        res = await fetch(endpoint, { signal: controller.signal });
+      } catch (err) {
+        clearTimeout(timeoutId);
+        if (err.name === 'AbortError') {
+          throw new Error('Server kelamaan nebak preset (>60 detik). Coba lagi atau pakai video dengan komentar lebih sedikit.');
+        }
         throw new Error('Gak bisa konek ke backend. Cek koneksi internet kamu.');
       }
+      clearTimeout(timeoutId);
 
       console.log('[Status]', res.status);
 
+      // ---- Handle error HTTP ----
       if (!res.ok) {
+        let errJson = null;
+        try {
+          errJson = await res.clone().json();
+        } catch {}
+
+        if (errJson && errJson.error) {
+          const status = errJson.status || res.status;
+
+          if (status === 504 || errJson.error.toLowerCase().includes('timeout') || errJson.error.toLowerCase().includes('kelamaan')) {
+            throw new Error('Server preset kelamaan (timeout). Coba lagi beberapa saat, atau pakai video dengan komentar lebih sedikit.');
+          }
+
+          if (status === 403) {
+            throw new Error('Akses ke server preset diblokir. Coba beberapa saat lagi.');
+          }
+
+          if (status === 404) {
+            throw new Error('Video gak ditemukan. Pastikan link masih aktif dan video publik.');
+          }
+
+          throw new Error(errJson.error);
+        }
+
         const errText = await res.text().catch(() => '');
-        throw new Error(`HTTP ${res.status} — ${errText.slice(0, 150) || 'Backend error'}`);
+        throw new Error(`HTTP ${res.status} — ${errText.slice(0, 100) || 'Backend error'}`);
       }
 
+      // ---- Parse JSON ----
       let json;
       try {
         json = await res.json();
       } catch {
-        throw new Error('Backend balikin response bukan JSON.');
+        throw new Error('Backend balikin response tidak valid. Coba lagi.');
       }
 
       console.log('[Response]', json);
 
-      if (!json.success) throw new Error(json.error || 'API gagal ambil data');
-      if (!json.data)    throw new Error('Data kosong dari API');
+      if (!json.success) {
+        const errMsg = json.error || 'API gagal ambil data';
 
+        if (errMsg.toLowerCase().includes('ekstrak') || errMsg.toLowerCase().includes('extract')) {
+          throw new Error('Gagal ekstrak video ID. Coba copy ulang link dari tombol Share TikTok, atau pakai link dari app TikTok langsung.');
+        }
+
+        throw new Error(errMsg);
+      }
+
+      if (!json.data) throw new Error('Data kosong dari API');
+
+      // ---- Mapping ----
       const { data } = json;
 
       const videoInfo = {
@@ -856,7 +902,6 @@
       const { videoInfo, preset } = payload;
       let html = '';
 
-      // ---- Info video ----
       if (videoInfo) {
         html += `<div class="info-video">`;
         if (videoInfo.deskripsi) {
@@ -878,17 +923,14 @@
         html += `</div>`;
       }
 
-      // ---- Kalau gak ada preset ----
       if (!preset || preset.length === 0) {
         html += `<p class="kosong">😕 Nggak ketemu link preset di video itu. Coba link lain ya!</p>`;
         hasilBox.innerHTML = html;
         return;
       }
 
-      // ---- List preset ----
       html += `<h3 class="sukses-judul">✅ Ditemukan ${preset.length} Link Preset!</h3>`;
 
-      // Kalau ada lebih dari 1 preset, tampilkan tombol "Buka Semua"
       if (preset.length > 1) {
         html += `<button type="button" class="tombol-buka" id="buka-semua">🌐 Buka Semua Link</button>`;
       }
@@ -914,7 +956,7 @@
       html += `</ul>`;
       hasilBox.innerHTML = html;
 
-      // ---- Event listener tombol salin ----
+      // Event: salin
       hasilBox.querySelectorAll('.tombol-salin[data-link]').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const link = btn.getAttribute('data-link');
@@ -931,7 +973,7 @@
         });
       });
 
-      // ---- Event listener tombol buka semua ----
+      // Event: buka semua
       const bukaSemua = document.getElementById('buka-semua');
       if (bukaSemua) {
         bukaSemua.addEventListener('click', () => {
@@ -951,7 +993,7 @@
       const cek = validasiUrl(url);
       if (!cek.valid) {
         tampilkanPesan(cek.pesan, 'error');
-        showToast('⚠️ ' + cek.pesan);
+        showToast(cek.pesan);
         return;
       }
 
@@ -964,8 +1006,8 @@
         simpanRiwayat(url, hasil.preset.length);
       } catch (err) {
         console.error('[Error]', err);
-        tampilkanPesan(`❌ Gagal: ${err.message}`, 'error');
-        showToast('❌ ' + err.message);
+        tampilkanPesan(`❌ ${err.message}`, 'error');
+        showToast('❌ ' + err.message.slice(0, 60));
       } finally {
         setLoading(false);
       }
@@ -979,7 +1021,6 @@
       cariPreset();
     });
 
-    // Paste dari clipboard
     pasteBtn.addEventListener('click', async () => {
       try {
         const text = await navigator.clipboard.readText();
@@ -995,16 +1036,13 @@
       }
     });
 
-    // Clear input
     clearBtn.addEventListener('click', () => {
       urlInput.value = '';
       urlInput.focus();
     });
 
-    // Hapus riwayat
     hapusRiwayat.addEventListener('click', hapusRiwayatAll);
 
-    // Render riwayat pas load
     renderRiwayat();
   </script>
 </body>
